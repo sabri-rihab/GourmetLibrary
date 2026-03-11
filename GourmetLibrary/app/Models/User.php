@@ -2,15 +2,15 @@
 
 namespace App\Models;
 
-// use Illuminate\Contracts\Auth\MustVerifyEmail;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Foundation\Auth\User as Authenticatable;
 use Illuminate\Notifications\Notifiable;
+use Laravel\Sanctum\HasApiTokens;
 
 class User extends Authenticatable
 {
     /** @use HasFactory<\Database\Factories\UserFactory> */
-    use HasFactory, Notifiable;
+    use HasFactory, Notifiable, HasApiTokens;
 
     /**
      * The attributes that are mass assignable.
@@ -21,6 +21,7 @@ class User extends Authenticatable
         'name',
         'email',
         'password',
+        'role',
     ];
 
     /**
@@ -42,7 +43,37 @@ class User extends Authenticatable
     {
         return [
             'email_verified_at' => 'datetime',
-            'password' => 'hashed',
+            'password'          => 'hashed',
         ];
+    }
+
+    // ─── Helpers ────────────────────────────────────────────────────────────────
+
+    public function isAdmin(): bool
+    {
+        return $this->role === 'admin';
+    }
+
+    public function isGourmand(): bool
+    {
+        return $this->role === 'gourmand';
+    }
+
+    // ─── Relationships ───────────────────────────────────────────────────────────
+
+    /**
+     * A user (gourmand) has many borrows.
+     */
+    public function borrows()
+    {
+        return $this->hasMany(Borrow::class);
+    }
+
+    /**
+     * Active borrows (currently borrowed books).
+     */
+    public function activeBorrows()
+    {
+        return $this->hasMany(Borrow::class)->where('status', 'active');
     }
 }
