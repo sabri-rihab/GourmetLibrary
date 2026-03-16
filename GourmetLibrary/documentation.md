@@ -14,6 +14,7 @@
 | G2  | Gourmand  | Search books                          | GET    | `/books/search`                   |
 | G3a | Gourmand  | Most popular books                    | GET    | `/books/popular`                  |
 | G3b | Gourmand  | New arrivals                          | GET    | `/books/new-arrivals`             |
+| SLUG| Gourmand  | Book detail via readable URL          | GET    | `/{categorySlug}/livres/{bookSlug}` |
 | A1a | Admin     | Create a category                     | POST   | `/admin/categories`               |
 | A1b | Admin     | Update a category                     | PUT    | `/admin/categories/{id}`          |
 | A1c | Admin     | Delete a category                     | DELETE | `/admin/categories/{id}`          |
@@ -219,6 +220,99 @@ POST /api/auth/login
     { "id": 18, "title": "Zéro Gluten", "author": "Maëlle Pichon", "arrival_date": "2026-03-10", "is_new_arrival": true, ... }
   ]
 }
+```
+
+---
+
+### [SLUG] Human-readable book detail URL
+
+| What     | Detail |
+|----------|--------|
+| **Route**      | `GET /api/{categorySlug}/livres/{bookSlug}` |
+| **Controller** | `app/Http/Controllers/BookController.php` → `showBySlug()` |
+| **Model used** | `Book`, `Category`, `BookCopy` |
+| **Migration**  | `database/migrations/2026_03_16_..._add_slug_to_books_table.php` |
+| **Auth**       | ✅ Bearer token required |
+
+**What is a slug?**
+
+A slug is a short, URL-safe version of a text string. Special characters, accents and spaces are removed or replaced:
+
+| Original text | Slug generated |
+|---|---|
+| `Cuisine Italienne` | `cuisine-italienne` |
+| `Les Meilleures Recettes de Pâtes` | `les-meilleures-recettes-de-pates` |
+| `Pâtisserie Française` | `patisserie-francaise` |
+
+This makes URLs **readable for humans** instead of using raw IDs like `/books/47`.
+
+**Why was this added?**
+
+Instead of saying `GET /api/books/47`, you can now say:
+```
+GET /api/cuisine-italienne/livres/les-meilleures-recettes-de-pates
+```
+This URL tells you immediately: category = *Cuisine Italienne*, book = *Les Meilleures Recettes de Pâtes*. It is better for APIs consumed by frontends, and matches the format `/{category-slug}/livres/{book-slug}` requested.
+
+**What was added to make it work:**
+
+| Layer | File | What changed |
+|-------|------|--------------|
+| **Migration** | `2026_03_16_..._add_slug_to_books_table.php` | Adds a `slug` VARCHAR column (unique) to the `books` table. Also **backfills** existing books: generates slugs from their titles, appending `-2`, `-3`, etc. if two books share the same title. |
+| **Model** | `app/Models/Book.php` | Added `slug` to `$fillable`. Added a `booted()` method with two Eloquent hooks: (1) `creating` — auto-generates a unique slug from `title` when a book is created without an explicit slug; (2) `updating` — re-generates the slug automatically if `title` changes and no manual `slug` was provided in the update payload. |
+| **Controller** | `app/Http/Controllers/BookController.php` | New `showBySlug(string $categorySlug, string $bookSlug)` method. Finds the category by slug, then finds the book inside it by slug. Returns full book detail + computed fields. |
+| **Route** | `routes/api.php` | `Route::get('/{categorySlug}/livres/{bookSlug}', ...)` registered inside the `auth:sanctum` middleware group. |
+
+**How `showBySlug()` works step by step:**
+1. Receives two URL parameters: `$categorySlug` (e.g. `cuisine-italienne`) and `$bookSlug` (e.g. `les-meilleures-recettes-de-pates`).
+2. Calls `Category::where('slug', $categorySlug)->firstOrFail()` — if the category slug doesn't exist, Laravel automatically returns **404 Not Found**.
+3. Calls `Book::where('category_id', $category->id)->where('slug', $bookSlug)->firstOrFail()` — this scopes the book search inside its category, preventing slug collisions across categories.
+4. Calls `$book->availableCopies()->count()` to return how many physical copies can be borrowed right now.
+5. Returns the full book object with `total_borrows`, `is_new_arrival`, `available_copies`, and the `canonical_url` field (the exact URL used to reach this book).
+
+**Postman setup:**
+- Method: `GET`
+- URL: `{{base_url}}/cuisine-italienne/livres/les-meilleures-recettes-de-pates`
+- Headers: `Authorization: Bearer {token}`
+- No body needed.
+
+> **How to know the slug?** Call `GET /api/books/category/cuisine-italienne` first — each book in the response has a `slug` field. Use that slug here.
+
+**Success response (200):**
+```json
+{
+  "success": true,
+  "data": {
+    "id": 7,
+    "category_id": 3,
+    "title": "Les Meilleures Recettes de Pâtes",
+    "slug": "les-meilleures-recettes-de-pates",
+    "author": "Carlo Marchetti",
+    "isbn": "9782012345678",
+    "description": "Un voyage culinaire en Italie...",
+    "published_year": 2019,
+    "publisher": "Marabout",
+    "language": "Français",
+    "total_copies": 4,
+    "arrival_date": "2025-11-01",
+    "category": {
+      "id": 3,
+      "name": "Cuisine Italienne",
+      "slug": "cuisine-italienne",
+      "color": "#22c55e",
+      "description": "La dolce vita dans votre assiette"
+    },
+    "total_borrows": 18,
+    "is_new_arrival": false,
+    "available_copies": 2,
+    "canonical_url": "/api/cuisine-italienne/livres/les-meilleures-recettes-de-pates"
+  }
+}
+```
+
+**Error response — wrong slug (404):**
+```json
+{ "message": "No query results for model [App\\Models\\Book]." }
 ```
 
 ---
@@ -590,9 +684,9 @@ This endpoint:
 ```
 categories          (id, name, slug, description, color)
     │
-    └── books       (id, category_id, title, author, isbn, description,
+    └── books       (id, category_id, title, slug, author, isbn, description,
     │               cover_image, published_year, publisher, language,
-    │               total_copies, arrival_date)
+    │               total_copies, arrival_date)   ← slug added by migration
     │
     └── book_copies (id, book_id, copy_number, condition, condition_notes, is_available)
                     condition ENUM: 'good' | 'degraded' | 'damaged' | 'lost'
@@ -611,9 +705,11 @@ users               (id, name, email, password, role)
 
 | File | Action | Purpose |
 |------|--------|---------|
-| `app/Http/Controllers/BookController.php` | **Created** | All book-related features (G1, G2, G3a, G3b, A2a, A2b, A2c) |
+| `app/Http/Controllers/BookController.php` | **Updated** | Added `showBySlug()` (SLUG feature); `slug` included in all `select()` projections |
 | `app/Http/Controllers/AdminController.php` | **Created** | Statistics (A3) and degraded copies report (A4) |
 | `app/Http/Controllers/CategoryController.php` | **Updated** | Added `update()` method (A1b), added role guard to `create()`, fixed `destroy()` to actually delete |
-| `routes/api.php` | **Updated** | All new routes wired to their controllers |
+| `app/Models/Book.php` | **Updated** | Added `slug` to `$fillable`, added `booted()` auto-slug hooks |
+| `database/migrations/2026_03_16_..._add_slug_to_books_table.php` | **Created** | Adds `slug` column + backfills existing rows |
+| `routes/api.php` | **Updated** | All new routes including slug URL pattern |
 
-All models (`Book`, `BookCopy`, `Borrow`, `Category`, `User`) and all migrations were **already in place** and did not need modification.
+All other models (`BookCopy`, `Borrow`, `Category`, `User`) and all original migrations were **already in place** and did not need modification.

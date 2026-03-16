@@ -64,6 +64,12 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/books/new-arrivals', [BookController::class, 'newArrivals'])
          ->name('books.new-arrivals');
 
+    // ── [US-SLUG] Human-readable book detail URL ──────────────────────────────
+    // GET /api/{categorySlug}/livres/{bookSlug}
+    // Example: GET /api/cuisine-italienne/livres/les-meilleures-recettes-de-pates
+    Route::get('/{categorySlug}/livres/{bookSlug}', [BookController::class, 'showBySlug'])
+         ->name('books.show-by-slug');
+
     // ── Admin Routes (token required; controller checks role === 'admin') ─────
     Route::prefix('admin')->name('admin.')->group(function () {
 

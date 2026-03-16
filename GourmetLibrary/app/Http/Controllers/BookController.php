@@ -31,8 +31,8 @@ class BookController extends Controller
             : Category::where('slug', $identifier)->firstOrFail();
 
         $books = $category->books()
-            ->select(['id', 'title', 'author', 'isbn', 'description',
-                       'cover_image', 'published_year', 'publisher',
+            ->select(['id', 'category_id', 'title', 'slug', 'author', 'isbn',
+                       'description', 'cover_image', 'published_year', 'publisher',
                        'language', 'total_copies', 'arrival_date'])
             ->orderBy('title')
             ->paginate(15);
@@ -73,7 +73,7 @@ class BookController extends Controller
         $query = $request->input('q');
 
         $books = Book::with('category:id,name,slug,color')
-            ->select(['id', 'category_id', 'title', 'author', 'isbn',
+            ->select(['id', 'category_id', 'title', 'slug', 'author', 'isbn',
                        'description', 'cover_image', 'published_year',
                        'publisher', 'language', 'total_copies', 'arrival_date'])
             ->where(function ($q) use ($query) {
@@ -155,7 +155,7 @@ class BookController extends Controller
         $limit = $request->input('limit', 10);
 
         $books = Book::with('category:id,name,slug,color')
-            ->select(['id', 'category_id', 'title', 'author', 'isbn',
+            ->select(['id', 'category_id', 'title', 'slug', 'author', 'isbn',
                        'description', 'cover_image', 'published_year',
                        'publisher', 'language', 'total_copies', 'arrival_date'])
             ->where('arrival_date', '>=', now()->subDays(30)->toDateString())
@@ -174,6 +174,40 @@ class BookController extends Controller
         return response()->json([
             'success' => true,
             'data'    => $books,
+        ], 200);
+    }
+
+    /**
+     * [US-SLUG] Get a single book by its category slug + book slug.
+     *
+     * GET /api/{categorySlug}/livres/{bookSlug}
+     *
+     * Example: GET /api/cuisine-italienne/livres/les-meilleures-recettes-de-pates
+     *
+     * Returns full book detail + its category info + available copy count.
+     */
+    public function showBySlug(Request $request, string $categorySlug, string $bookSlug): JsonResponse
+    {
+        // Find the category (404 if slug doesn't exist)
+        $category = Category::where('slug', $categorySlug)->firstOrFail();
+
+        // Find the book within that category (404 if not found)
+        $book = Book::with(['category:id,name,slug,color,description'])
+            ->where('category_id', $category->id)
+            ->where('slug', $bookSlug)
+            ->firstOrFail();
+
+        // Count how many copies are currently available to borrow
+        $availableCount = $book->availableCopies()->count();
+
+        return response()->json([
+            'success' => true,
+            'data'    => array_merge($book->toArray(), [
+                'total_borrows'    => $book->total_borrows,
+                'is_new_arrival'   => $book->is_new_arrival,
+                'available_copies' => $availableCount,
+                'canonical_url'    => "/api/{$categorySlug}/livres/{$bookSlug}",
+            ]),
         ], 200);
     }
 
