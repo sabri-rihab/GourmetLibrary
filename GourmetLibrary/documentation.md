@@ -713,3 +713,300 @@ users               (id, name, email, password, role)
 | `routes/api.php` | **Updated** | All new routes including slug URL pattern |
 
 All other models (`BookCopy`, `Borrow`, `Category`, `User`) and all original migrations were **already in place** and did not need modification.
+
+---
+
+## 🔍 Deep Dive — Slug Feature: Line-by-Line Code Explanation
+
+This section explains **every single line** of code that was written for the slug feature, in the exact order the code runs when a request arrives.
+
+---
+
+### Part 1 — The Migration: `2026_03_16_101727_add_slug_to_books_table.php`
+
+This file tells Laravel how to modify the database. It runs once with `php artisan migrate`.
+
+```php
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
+```
+- **`Migration`** — the base class every migration must extend.
+- **`Blueprint`** — the object used to describe table columns (like `$table->string(...)`).
+- **`Schema`** — Laravel's facade to run SQL `CREATE TABLE`, `ALTER TABLE`, etc. without writing raw SQL.
+- **`Str`** — Laravel's string helper. We need it here for `Str::slug()` to generate slugs during the backfill.
+
+```php
+return new class extends Migration
+```
+- An anonymous class (no name) that extends `Migration`. Laravel discovers it automatically from the file.
+
+---
+
+#### `up()` — runs when you execute `php artisan migrate`
+
+```php
+Schema::table('books', function (Blueprint $table) {
+    $table->string('slug')->nullable()->unique()->after('title');
+});
+```
+- **`Schema::table('books', ...)`** — opens the existing `books` table to modify it (as opposed to `Schema::create` which would create a new table).
+- **`$table->string('slug')`** — adds a `VARCHAR(255)` column named `slug`.
+- **`->nullable()`** — at this point we allow NULL because existing rows don't have a slug yet (we fill them in the next step).
+- **`->unique()`** — tells the database to create a UNIQUE INDEX on this column. Two books can't have the same slug.
+- **`->after('title')`** — places the column right after `title` in the table layout (cosmetic, but keeps the schema readable).
+
+```php
+\App\Models\Book::all()->each(function (\App\Models\Book $book) {
+```
+- **`Book::all()`** — loads every existing book from the database into a Laravel Collection.
+- **`->each(...)`** — iterates over each book, calling the anonymous function with the current book as `$book`.
+- We need this loop because the books that existed **before** this migration have no slug yet — we must generate one for each of them.
+
+```php
+    $base = Str::slug($book->title);
+```
+- **`Str::slug()`** — Laravel's built-in helper that converts any string to a URL-safe slug:
+  - Converts to lowercase
+  - Removes accents: `é → e`, `â → a`, `ç → c`
+  - Replaces spaces with `-`
+  - Removes any special characters
+  - Example: `"Les Meilleures Recettes de Pâtes"` → `"les-meilleures-recettes-de-pates"`
+- We save this as `$base` because it's the starting point. If there's a collision, we'll append a number to `$base`.
+
+```php
+    $slug = $base;
+    $i    = 1;
+```
+- `$slug` starts as a copy of `$base`. This is the candidate slug we'll try to insert.
+- `$i` is a counter used if we need to append `-2`, `-3`, etc.
+
+```php
+    while (\App\Models\Book::where('slug', $slug)->where('id', '!=', $book->id)->exists()) {
+        $slug = "{$base}-{$i}";
+        $i++;
+    }
+```
+- **The uniqueness loop**: checks whether another book (with a different `id`) already has this slug.
+- **`where('slug', $slug)`** — look for a row where slug = our candidate.
+- **`->where('id', '!=', $book->id)`** — exclude the current book itself from the check (otherwise it would always find "itself" and loop forever).
+- **`->exists()`** — returns `true` if such a row exists, `false` if the slug is free.
+- If the slug is taken: build a new candidate by appending `-1`, `-2`, etc., and loop again.
+- Example: if `"ma-cuisine"` is taken, try `"ma-cuisine-1"`, then `"ma-cuisine-2"`, until a free slot is found.
+
+```php
+    $book->updateQuietly(['slug' => $slug]);
+```
+- **`updateQuietly()`** — saves `slug` to the database **without** firing Eloquent model events (like `updating` or `updated`). This is important: we don't want the model's `booted()` hooks to trigger during the backfill migration, because the hooks also try to generate slugs.
+
+```php
+Schema::table('books', function (Blueprint $table) {
+    $table->string('slug')->nullable(false)->change();
+});
+```
+- Now that **every row** has a slug, we tighten the constraint.
+- **`->nullable(false)`** — forbids NULL from now on. Future rows must always have a slug.
+- **`->change()`** — tells Laravel this is a modification of an existing column, not the creation of a new one.
+
+---
+
+#### `down()` — runs when you `php artisan migrate:rollback`
+
+```php
+Schema::table('books', function (Blueprint $table) {
+    $table->dropColumn('slug');
+});
+```
+- **`dropColumn('slug')`** — removes the `slug` column entirely when the migration is rolled back.
+
+---
+
+### Part 2 — The Model: `app/Models/Book.php`
+
+The model is the PHP class that represents a row in the `books` table. We added three things.
+
+#### 2a. `$fillable` — allow slug to be mass-assigned
+
+```php
+protected $fillable = [
+    'category_id',
+    'title',
+    'slug',       // ← added
+    'author',
+    ...
+];
+```
+- **`$fillable`** is Laravel's whitelist of columns that can be set via `Book::create([...])` or `$book->update([...])`.
+- Without `'slug'` here, any attempt to write to the slug column via mass-assignment would be silently ignored.
+
+---
+
+#### 2b. `booted()` — automatic slug generation
+
+```php
+protected static function booted(): void
+{
+```
+- **`booted()`** is a special Laravel method called once when the model class is first loaded. It's the correct place to register **Eloquent model event listeners**.
+
+```php
+    static::creating(function (Book $book) {
+        if (empty($book->slug)) {
+            $book->slug = static::generateUniqueSlug($book->title);
+        }
+    });
+```
+- **`static::creating(...)`** — registers a listener for the `creating` event, which fires **just before** a new book is inserted into the database.
+- **`if (empty($book->slug))`** — only generate a slug automatically if the caller didn't provide one. This lets an admin pass a custom slug if they want.
+- **`static::generateUniqueSlug($book->title)`** — calls our custom method (explained below) to produce a unique slug from the title.
+- After this hook runs, `$book->slug` is set, and Laravel saves it to the database.
+
+```php
+    static::updating(function (Book $book) {
+        if ($book->isDirty('title') && ! $book->isDirty('slug')) {
+            $book->slug = static::generateUniqueSlug($book->title, $book->id);
+        }
+    });
+```
+- **`static::updating(...)`** — fires **just before** an existing book is updated.
+- **`$book->isDirty('title')`** — returns `true` if the `title` field has changed since the book was loaded from the database. "Dirty" = modified but not yet saved.
+- **`! $book->isDirty('slug')`** — returns `true` if `slug` was NOT manually changed. If the admin explicitly provided a new slug, we respect it and don't overwrite it.
+- Combined logic: **"if the title changed AND the slug was not manually updated → regenerate the slug from the new title"**.
+- We pass `$book->id` as the second argument so the uniqueness check excludes this book itself (it currently holds the old slug, which is fine to reuse or replace).
+
+---
+
+#### 2c. `generateUniqueSlug()` — the shared slug factory
+
+```php
+public static function generateUniqueSlug(string $title, ?int $exceptId = null): string
+{
+```
+- **`static`** — this is a class-level method, callable without creating a Book instance.
+- **`string $title`** — the raw title to convert (e.g. `"Les Meilleures Recettes de Pâtes"`).
+- **`?int $exceptId = null`** — optional. When updating an existing book, pass its `id` here so the uniqueness check ignores the book's own current slug.
+
+```php
+    $base = Str::slug($title);
+    $slug = $base;
+    $i    = 1;
+```
+- Same logic as in the migration: `$base` is the clean slug, `$slug` is the working candidate, `$i` is the collision counter.
+
+```php
+    while (
+        static::where('slug', $slug)
+              ->when($exceptId, fn ($q) => $q->where('id', '!=', $exceptId))
+              ->exists()
+    ) {
+        $slug = "{$base}-{$i}";
+        $i++;
+    }
+```
+- **`static::where('slug', $slug)`** — query the `books` table for a row with this slug.
+- **`->when($exceptId, fn ($q) => $q->where('id', '!=', $exceptId))`** — `when()` only adds the extra `WHERE id != ?` clause if `$exceptId` is not null. This is the "exclude myself" guard for updates.
+- **`->exists()`** — runs `SELECT EXISTS(...)` — very efficient, returns a boolean.
+- The loop keeps incrementing `$i` until the slug IS free.
+
+```php
+    return $slug;
+}
+```
+- Returns the first free slug found.
+
+---
+
+### Part 3 — The Controller: `app/Http/Controllers/BookController.php`
+
+The controller receives the HTTP request and returns the JSON response.
+
+```php
+public function showBySlug(Request $request, string $categorySlug, string $bookSlug): JsonResponse
+{
+```
+- **`Request $request`** — Laravel injects the current HTTP request (carries headers, user token, etc.).
+- **`string $categorySlug`** — the first URL parameter, e.g. `"cuisine-italienne"`. Comes from the route `/{categorySlug}/livres/{bookSlug}`.
+- **`string $bookSlug`** — the second URL parameter, e.g. `"les-meilleures-recettes-de-pates"`.
+- **`: JsonResponse`** — the return type. This method always returns a JSON HTTP response.
+
+```php
+    $category = Category::where('slug', $categorySlug)->firstOrFail();
+```
+- Queries the `categories` table: `SELECT * FROM categories WHERE slug = 'cuisine-italienne' LIMIT 1`.
+- **`->firstOrFail()`** — if no row is found, Laravel automatically aborts the request with a **404 Not Found** JSON response. You never need to write `if (!$category) return 404` manually.
+
+```php
+    $book = Book::with(['category:id,name,slug,color,description'])
+        ->where('category_id', $category->id)
+        ->where('slug', $bookSlug)
+        ->firstOrFail();
+```
+- **`Book::with([...])`** — eager-loads the related `Category` in the same query (avoids a second database call later).
+- **`'category:id,name,slug,color,description'`** — the colon syntax selects only specific columns from `categories`, keeping the response lean.
+- **`->where('category_id', $category->id)`** — scopes the search to books **inside** the correct category. Without this, a book slug from Category A could accidentally match a book in Category B.
+- **`->where('slug', $bookSlug)`** — the actual slug match.
+- **`->firstOrFail()`** — again, automatic 404 if not found.
+
+```php
+    $availableCount = $book->availableCopies()->count();
+```
+- **`$book->availableCopies()`** — calls the `availableCopies()` relationship defined in `Book.php`, which returns copies where `is_available = true` AND `condition IN ('good', 'degraded')`.
+- **`->count()`** — runs `SELECT COUNT(*) FROM book_copies WHERE book_id = ? AND is_available = 1 AND condition IN ('good', 'degraded')`.
+- Result: an integer telling the user how many physical copies they could borrow right now.
+
+```php
+    return response()->json([
+        'success' => true,
+        'data'    => array_merge($book->toArray(), [
+            'total_borrows'    => $book->total_borrows,
+            'is_new_arrival'   => $book->is_new_arrival,
+            'available_copies' => $availableCount,
+            'canonical_url'    => "/api/{$categorySlug}/livres/{$bookSlug}",
+        ]),
+    ], 200);
+```
+- **`$book->toArray()`** — converts the Eloquent model (and its eager-loaded `category`) into a plain PHP array ready for JSON encoding.
+- **`array_merge(..., [...])`** — adds four extra fields on top of the model's own data:
+  - `total_borrows` — calls the `getTotalBorrowsAttribute()` accessor from `Book.php` (counts all borrow records via `hasManyThrough`).
+  - `is_new_arrival` — calls `getIsNewArrivalAttribute()` — `true` if `arrival_date` is within the last 30 days.
+  - `available_copies` — the count we computed above.
+  - `canonical_url` — the exact URL that was used, so a frontend can store or share it. Example: `"/api/cuisine-italienne/livres/les-meilleures-recettes-de-pates"`.
+- **`response()->json([...], 200)`** — builds an HTTP 200 OK response with a `Content-Type: application/json` header.
+
+---
+
+### Part 4 — The Route: `routes/api.php`
+
+```php
+Route::get('/{categorySlug}/livres/{bookSlug}', [BookController::class, 'showBySlug'])
+     ->name('books.show-by-slug');
+```
+- **`Route::get(...)`** — registers an HTTP GET route.
+- **`'/{categorySlug}/livres/{bookSlug}'`** — the URL pattern. The `{...}` parts are named dynamic parameters. Laravel extracts them and passes them as arguments to the controller method.
+  - `{categorySlug}` → becomes `$categorySlug` in `showBySlug()`
+  - `livres` → a fixed literal word in the URL (French for "books"). This is what makes the URL readable.
+  - `{bookSlug}` → becomes `$bookSlug` in `showBySlug()`
+- **`[BookController::class, 'showBySlug']`** — the handler: use the `showBySlug` method of `BookController`.
+- **`->name('books.show-by-slug')`** — gives this route a name so it can be referenced elsewhere in code with `route('books.show-by-slug', [...])`.
+- This route is registered **inside** `Route::middleware('auth:sanctum')->group(...)`, so Laravel automatically validates the Bearer token before the controller even runs.
+
+---
+
+### Summary — The full journey of one request
+
+```
+GET /api/cuisine-italienne/livres/les-meilleures-recettes-de-pates
+Authorization: Bearer 3|abc123...
+```
+
+| Step | What happens |
+|------|-------------|
+| 1 | Laravel matches the URL pattern `/{categorySlug}/livres/{bookSlug}` in `api.php` |
+| 2 | The `auth:sanctum` middleware checks the Bearer token — if invalid → 401 |
+| 3 | `showBySlug("cuisine-italienne", "les-meilleures-recettes-de-pates")` is called |
+| 4 | `Category::where('slug', 'cuisine-italienne')->firstOrFail()` — finds the category or 404 |
+| 5 | `Book::where('category_id', 3)->where('slug', 'les-meilleures-recettes-de-pates')->firstOrFail()` — finds the book or 404 |
+| 6 | `$book->availableCopies()->count()` — counts available copies |
+| 7 | Response is built with `array_merge`, adding `total_borrows`, `is_new_arrival`, `available_copies`, `canonical_url` |
+| 8 | HTTP 200 JSON response returned to Postman/frontend |
